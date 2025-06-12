@@ -6,7 +6,7 @@ from reconstruction_engine import run_inference
 import open3d as o3d
 import numpy as np
 
-DATA_DIRECTORY = "/home/fabian/3d_reconstruction/zed_output/"
+DATA_DIRECTORY = "/home/fabian/3d_reconstruction/src/zed_output/"
 
 def run():
     print("Starting reconstruction...")
