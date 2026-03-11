@@ -1,33 +1,50 @@
 import logging
+import sys
+import time
+import threading
+from typing import List, Dict, Any
 
-
-print("Applying concise RospyLogger.findCaller patch for Python 3.11+...")
+import numpy as np
+import open3d as o3d
+import rospy
 import rosgraph.roslogging
-_RospyLogger_class = rosgraph.roslogging.RospyLogger
-_RospyLogger_class.findCaller = logging.Logger.findCaller
+from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import Image as RosImage
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
 
+# === STANDARD MESSAGE IMPORTS (CORRECTED) =====================================
+# Import standard messages for detections
+from vision_msgs.msg import BoundingBox2D, Detection2D, Detection2DArray, ObjectHypothesisWithPose
+# CORRECTED: Import Pose2D from its proper location in geometry_msgs
+from geometry_msgs.msg import Pose2D
+
+import hashlib
+
+# Apply concise RospyLogger.findCaller patch for Python 3.11+
+print("Applying concise RospyLogger.findCaller patch for Python 3.11+...")
+if sys.version_info.major == 3 and sys.version_info.minor >= 11:
+    _RospyLogger_class = rosgraph.roslogging.RospyLogger
+    if _RospyLogger_class.findCaller is not logging.Logger.findCaller:
+        _RospyLogger_class.findCaller = logging.Logger.findCaller
 if logging.getLoggerClass() != _RospyLogger_class:
     logging.setLoggerClass(_RospyLogger_class)
 
+def label_to_id(label: str) -> int:
+    h = hashlib.sha256(label.encode('utf-8')).digest()
+    int_id = int.from_bytes(h[:8], 'big', signed=True)
+    return int_id
 
-import rospy
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
-import open3d as o3d
-import numpy as np
-import time
+# ==============================================================================
+# === HELPER FUNCTIONS (PRESERVED) =============================================
+# ==============================================================================
 
-from sensor_msgs.msg import PointCloud2, PointField, Image as RosImage, CameraInfo
-
-
-def o3d_to_ros_pointcloud2(o3d_pc, frame_id="map", stamp=None):
+def o3d_to_ros_pointcloud2(o3d_pc, frame_id="zed2i_left_camera_optical_frame", stamp=None):
+    """Converts a single Open3D point cloud object to a ROS PointCloud2 message."""
     if stamp is None:
         stamp = rospy.Time.now() if rospy.core.is_initialized() else rospy.Time.from_sec(time.time())
 
-    header = Header()
-    header.stamp = stamp
-    header.frame_id = frame_id
-
+    header = Header(stamp=stamp, frame_id=frame_id)
     points_xyz = np.asarray(o3d_pc.points, dtype=np.float32)
     n_points = points_xyz.shape[0]
 
@@ -59,44 +76,138 @@ def o3d_to_ros_pointcloud2(o3d_pc, frame_id="map", stamp=None):
         fields=fields, point_step=point_step, row_step=point_step * n_points, data=cloud_data_bytes
     )
 
-class RosPointCloudPublisher:
-    def __init__(self, default_topic_name="/my_o3d_cloud", default_frame_id="world"):
-        self.pub = None
-        self.topic_name = default_topic_name
-        self.frame_id = default_frame_id
-        self.is_setup = False
-        print('here')
-        self.setup_publisher()
+def numpy_to_ros_image(mask_array, encoding="mono8"):
+    """(PRESERVED) Manually converts a 2D NumPy array into a sensor_msgs/Image."""
+    if mask_array.dtype != np.uint8:
+        mask_array = mask_array.astype(np.uint8)
 
-    def setup_publisher(self):
-        if not rospy.core.is_initialized():
-            rospy.init_node('ros_data_tools_node', anonymous=True)
-            rospy.loginfo("ROS node initialized by RosImageSubscriber.")        
-        self.topic_name = rospy.get_param("~pointcloud_topic", self.topic_name)
-        self.frame_id = rospy.get_param("~pointcloud_frame_id", self.frame_id)
-        self.pub = rospy.Publisher(self.topic_name, PointCloud2, queue_size=5)
-        self.is_setup = True
-        print(f"RosPointCloudPublisher: Publishing to '{self.topic_name}'")
-        return True
+    img_msg = RosImage()
+    img_msg.height, img_msg.width = mask_array.shape
+    img_msg.encoding = encoding
+    img_msg.step = img_msg.width
+    img_msg.is_bigendian = 0
+    img_msg.data = mask_array.tobytes()
+    return img_msg
 
-    def publish(self, o3d_pointcloud, stamp=None):
-        current_stamp = stamp if stamp is not None else (rospy.Time.now() if rospy.core.is_initialized() else None)
-        ros_msg = o3d_to_ros_pointcloud2(o3d_pointcloud, frame_id=self.frame_id, stamp=current_stamp)
+
+# ==============================================================================
+# === PUBLISHER CLASSES (CORRECTED) ============================================
+# ==============================================================================
+
+class RosInstanceMaskPublisher:
+    """Continuously publishes a static set of masks merged into one instance image."""
+    def __init__(self, topic_name="/pipeline/instance_mask"):
+        self.pub = rospy.Publisher(topic_name, RosImage, queue_size=10)
+        rospy.loginfo(f"RosInstanceMaskPublisher: Publishing to '{topic_name}'")
+
+    def publish(self, masks_numpy_list: List[np.ndarray], header: Header):
+        """Continuously publishes the instance mask. This is a blocking method."""
+        if not masks_numpy_list:
+            rospy.logwarn("Cannot publish empty list of masks.")
+            return
+
+        height, width = masks_numpy_list[0].shape
+        instance_mask = np.zeros((height, width), dtype=np.uint16)
+        for i, mask in enumerate(masks_numpy_list):
+            instance_mask[mask] = i + 1
+
         rate = rospy.Rate(1.0)
-        self.pub.publish(ros_msg)
         while not rospy.is_shutdown():
-            current_stamp = stamp
-            if current_stamp is None:
-                 current_stamp = rospy.Time.now() if rospy.core.is_initialized() else rospy.Time.from_sec(time.time())
-
-            ros_msg = o3d_to_ros_pointcloud2(o3d_pointcloud, frame_id=self.frame_id, stamp=current_stamp)
-            self.pub.publish(ros_msg)
             try:
+                header.stamp = rospy.Time.now()
+                img_msg = RosImage(
+                    header=header, height=height, width=width, encoding="mono16",
+                    is_bigendian=0, step=width * 2, data=instance_mask.tobytes()
+                )
+                self.pub.publish(img_msg)
+                rospy.loginfo_throttle(5, f"Continuously publishing instance mask with {len(masks_numpy_list)} objects...")
                 rate.sleep()
             except rospy.ROSInterruptException:
-                rospy.loginfo(f"Continuous publishing to '{self.topic_name}' interrupted.")
-                break 
+                rospy.loginfo("Mask publishing interrupted.")
+                break
 
+
+class RosDetection2DArrayPublisher:
+    """Continuously publishes a static set of 2D detections."""
+    def __init__(self, topic_name="/pipeline/detections_2d"):
+        self.pub = rospy.Publisher(topic_name, Detection2DArray, queue_size=10)
+        rospy.loginfo(f"RosDetection2DArrayPublisher: Publishing to '{topic_name}'")
+
+    def publish(self, bounding_box_dicts: List[Dict[str, Any]], header: Header):
+        """
+        Publishes detections given dicts with keys:
+            - "box": (cx, cy, w, h)
+            - "label": str
+            - "score": float
+        """
+        if not bounding_box_dicts:
+            rospy.logwarn("Cannot publish empty list of detections.")
+            return
+
+        detections = []
+        for bb in bounding_box_dicts:
+            cx, cy, w, h = bb["box"]
+            label = bb["label"]
+            score = bb.get("score", 1.0)
+
+            center_pose = Pose2D(x=float(cx), y=float(cy), theta=0.0)
+            bbox_msg = BoundingBox2D(center=center_pose, size_x=float(w), size_y=float(h))
+
+            label_id = label_to_id(label)
+            hypothesis = ObjectHypothesisWithPose(id=label_id, score=score)
+
+            detections.append(Detection2D(results=[hypothesis], bbox=bbox_msg))
+
+        rate = rospy.Rate(1.0)
+        while not rospy.is_shutdown():
+            try:
+                current_stamp = rospy.Time.now()
+                header.stamp = current_stamp
+                for det in detections:
+                    det.header = header
+
+                array_msg = Detection2DArray(header=header, detections=detections)
+                self.pub.publish(array_msg)
+                rospy.loginfo_throttle(5, f"Continuously publishing {len(detections)} detections...")
+                rate.sleep()
+            except rospy.ROSInterruptException:
+                rospy.loginfo("Detection publishing interrupted.")
+                break
+
+class RosMergedPointCloudPublisher:
+    """Continuously publishes a static, merged point cloud."""
+    def __init__(self, topic_name="/pipeline/reconstructed_point_cloud"):
+        self.pub = rospy.Publisher(topic_name, PointCloud2, queue_size=10)
+        rospy.loginfo(f"RosMergedPointCloudPublisher: Publishing to '{topic_name}'")
+
+    def publish(self, o3d_pointclouds: List[o3d.geometry.PointCloud], header: Header):
+        """Continuously publishes the merged point cloud. This is a blocking method."""
+        if not o3d_pointclouds:
+            rospy.logwarn("Cannot publish empty list of point clouds.")
+            return
+
+        merged_pc = o3d.geometry.PointCloud()
+        for pc in o3d_pointclouds:
+            merged_pc += pc
+
+        if not merged_pc.has_points():
+            rospy.logwarn("Merged point cloud has no points.")
+            return
+
+        rate = rospy.Rate(1.0)
+        while not rospy.is_shutdown():
+            try:
+                ros_msg = o3d_to_ros_pointcloud2(merged_pc, frame_id=header.frame_id, stamp=rospy.Time.now())
+                self.pub.publish(ros_msg)
+                rospy.loginfo_throttle(5, f"Continuously publishing merged point cloud...")
+                rate.sleep()
+            except rospy.ROSInterruptException:
+                rospy.loginfo("Point cloud publishing interrupted.")
+                break
+
+# ==============================================================================
+# === SUBSCRIBER CLASS (PRESERVED) =============================================
+# ==============================================================================
 class RosImageSubscriber:
     def __init__(self,
                  rgb_topic="/camera/color/image_raw_placeholder",
@@ -235,20 +346,20 @@ class RosImageSubscriber:
             
             depth_image_np, effective_encoding = self._ros_image_to_numpy(ros_depth_msg)
 
-            if depth_image_np is None: return None
+            if depth_image_np is None: return None, None
 
             if effective_encoding == 'depth_mm':
                 rospy.loginfo(f"Received and manually converted 16UC1 Depth image (shape: {depth_image_np.shape})")
                 if convert_to_meters:
-                    return depth_image_np.astype(np.float32) / 1000.0
+                    return depth_image_np.astype(np.float32) / 1000.0, ros_depth_msg
                 else:
-                    return depth_image_np.astype(np.uint16)
+                    return depth_image_np.astype(np.uint16), ros_depth_msg
             elif effective_encoding == 'depth_m':
                 rospy.loginfo(f"Received and manually converted 32FC1 Depth image (shape: {depth_image_np.shape})")
-                return depth_image_np.astype(np.float32)
+                return depth_image_np.astype(np.float32), ros_depth_msg
             else:
                 rospy.logerr(f"Expected Depth compatible encoding from Depth topic, but got effective encoding: {effective_encoding}")
-                return None
+                return None, None
                 
         except rospy.ROSException as e:
             rospy.logerr(f"Timeout or error waiting for Depth message on {self.depth_topic}: {e}")
@@ -268,43 +379,61 @@ class RosImageSubscriber:
     def get_all_data(self, depth_in_meters=True):
         rospy.loginfo("Attempting to fetch all RGB, Depth, and CameraInfo data (manual conversion)...")
         rgb = self.get_rgb_image()
-        depth = self.get_depth_image(convert_to_meters=depth_in_meters)
+        depth, depth_msg = self.get_depth_image(convert_to_meters=depth_in_meters)
         intrinsics = self.get_camera_intrinsics()
-        
+
+        source_header = depth_msg.header
+        print(source_header)
         if rgb is not None and depth is not None and intrinsics is not None:
             rospy.loginfo("Successfully fetched all required image data (manual conversion).")
         else:
             rospy.logwarn("Failed to fetch one or more image data components (manual conversion).")
-        return rgb, depth, intrinsics
-
-
+        return rgb, depth, intrinsics, source_header
+# ==============================================================================
+# === EXAMPLE USAGE BLOCK WITH THREADING =======================================
+# ==============================================================================
 if __name__ == '__main__':
-    if not rospy.core.is_initialized():
-        rospy.init_node('ros_data_tools_node', anonymous=True)
-        rospy.loginfo("ROS node initialized in __main__.")
+    rospy.init_node('ros_data_tools_node', anonymous=True)
 
-    image_sub = RosImageSubscriber(
-        rgb_topic="/zed2i/zed_node/left/image_rect_color",
-        depth_topic="/zed2i/zed_node/depth/depth_registered",
-        cam_info_topic="/zed2i/zed_node/rgb/camera_info"
-    )
+    # --- Simulate getting a single set of perception results ---
+    rospy.loginfo("Simulating one-time perception for two objects...")
+    header = Header(stamp=rospy.Time.now(), frame_id="zed2i_left_camera_optical_frame")
 
-    rospy.loginfo("Attempting to get single set of image data...")
-    rgb_data, depth_data_metric, K_data = image_sub.get_all_data()
+    dummy_masks = [np.zeros((480, 640), dtype=bool) for _ in range(2)]
+    dummy_masks[0][100:200, 150:250] = True
+    dummy_masks[1][300:350, 400:500] = True
 
-    if rgb_data is not None:
-        rospy.loginfo(f"Main: Got RGB image, shape: {rgb_data.shape}")
-    else:
-        rospy.logwarn("Main: Failed to get RGB image.")
+    dummy_bboxes = [(200.0, 150.0, 100.0, 100.0), (450.0, 325.0, 100.0, 50.0)]
 
-    if depth_data_metric is not None:
-        rospy.loginfo(f"Main: Got Depth image (meters), shape: {depth_data_metric.shape}, min: {np.min(depth_data_metric[depth_data_metric>0]) if np.any(depth_data_metric>0) else 'N/A'}, max: {np.max(depth_data_metric)}")
-    else:
-        rospy.logwarn("Main: Failed to get Depth image.")
+    dummy_pcs = [o3d.geometry.PointCloud(), o3d.geometry.PointCloud()]
+    points1 = np.random.rand(100, 3) * [0.1, 0.1, 0.05] + [-0.2, 0, 0.5]
+    points2 = np.random.rand(80, 3) * [0.05, 0.1, 0.1] + [0.2, 0.1, 0.6]
+    dummy_pcs[0].points = o3d.utility.Vector3dVector(points1)
+    dummy_pcs[1].points = o3d.utility.Vector3dVector(points2)
+    dummy_pcs[0].paint_uniform_color([1, 0, 0]); dummy_pcs[1].paint_uniform_color([0, 1, 0])
 
-    if K_data is not None:
-        rospy.loginfo(f"Main: Got Intrinsics K:\n{K_data}")
-    else:
-        rospy.logwarn("Main: Failed to get Intrinsics.")
+    # --- Initialize publishers ---
+    rospy.loginfo("Initializing publishers...")
+    mask_pub = RosInstanceMaskPublisher()
+    bbox_pub = RosDetection2DArrayPublisher()
+    pc_pub = RosMergedPointCloudPublisher()
 
-    rospy.loginfo("Example finished.")
+    # --- Setup and start publishing threads ---
+    rospy.loginfo("Starting continuous publishing threads...")
+    mask_thread = threading.Thread(target=mask_pub.publish, args=(dummy_masks, header), daemon=True)
+    bbox_thread = threading.Thread(target=bbox_pub.publish, args=(dummy_bboxes, header), daemon=True)
+    pc_thread = threading.Thread(target=pc_pub.publish, args=(dummy_pcs, header), daemon=True)
+
+    mask_thread.start()
+    bbox_thread.start()
+    pc_thread.start()
+
+    rospy.loginfo("\nAll publishers are running continuously. Press Ctrl+C to stop.")
+    rospy.loginfo("You can inspect topics with commands like:")
+    rospy.loginfo("rostopic echo /pipeline/instance_mask")
+    rospy.loginfo("rostopic echo /pipeline/detections_2d")
+    rospy.loginfo("rostopic echo /pipeline/reconstructed_point_cloud")
+
+    rospy.spin()
+
+    rospy.loginfo("Shutting down.")

@@ -487,7 +487,7 @@ def infer_scene_points(model, rgb_image_np, depth_image_np_metric, mask_image_np
 
 def run_inference(rgb_image_np,
                   depth_image_np,
-                  mask_image_np,
+                  masks_np_list,         # CHANGED: Now accepts a list of masks
                   intrinsics_np,
                   c2w_np=None,
                   n_pred_views=5,
@@ -496,48 +496,99 @@ def run_inference(rgb_image_np,
                   no_pred_mask=False,
                   no_filter_input_view=False,
                   run_octmae=False,
-                  output_filename="inference_points.ply"):
+                  output_filename_base="inference_points"): # CHANGED: Now a base for unique filenames
+    """
+    Runs the Rayst3r inference process for a list of object masks in a scene.
 
+    Args:
+        rgb_image_np (np.ndarray): The single RGB image for the scene.
+        depth_image_np (np.ndarray): The single depth image for the scene (in meters).
+        masks_np_list (List[np.ndarray]): A list of boolean NumPy arrays, where each array is a mask
+                                           for a single object of interest.
+        intrinsics_np (np.ndarray): The 3x3 camera intrinsics matrix.
+        c2w_np (np.ndarray, optional): The camera-to-world transformation matrix. Defaults to identity.
+        output_filename_base (str, optional): The base name for the output .ply files. Each object's
+                                              reconstruction will be saved with an index.
 
+    Returns:
+        List[Dict[str, Any] or None]: A list containing the results for each mask.
+                                     Each item is a dictionary with:
+                                     - 'point_cloud': The Open3D point cloud object.
+                                     - 'bbox_3d': The oriented 3D bounding box of the point cloud.
+                                     - 'input_mask': The original NumPy mask used for this reconstruction.
+                                     If a reconstruction fails for an object, the corresponding item
+                                     in the list will be None.
+    """
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
+    # --- Model and DINO setup (do this only once) ---
+    print("Loading Rayst3r and DINOv2 models...")
     rayst3r_checkpoint_path = hf_hub_download("bartduis/rayst3r", "rayst3r.pth")
     model = Rayst3rModelWrapper(rayst3r_checkpoint_path, distributed=False, device=device_str)
-    
+
     dino_model = torch.hub.load('facebookresearch/dinov2', "dinov2_vitl14_reg", verbose=False)
     dino_model.eval()
     dino_model.to(device_str)
+    print("Models loaded successfully.")
 
-    if not c2w_np is None:
+    if c2w_np is not None:
         c2w_original_np = c2w_np
     else:
         c2w_original_np = np.eye(4)
 
-    all_points_tensor = infer_scene_points(
-        model=model,
-        dino_model=dino_model,
-        rgb_image_np=rgb_image_np,
-        depth_image_np_metric=depth_image_np,
-        mask_image_np=mask_image_np,
-        intrinsics_np=intrinsics_np,
-        c2w_original_np=c2w_original_np,
-        run_octmae=run_octmae,
-        set_conf=set_conf,    
-        no_input_mask=no_input_mask, 
-        no_pred_mask=no_pred_mask,   
-        no_filter_input_view=no_filter_input_view, 
-        n_pred_views=n_pred_views, 
-    )
+    # --- List to store results for each object ---
+    results = []
 
-    if all_points_tensor is None or all_points_tensor.shape[0] == 0:
-        if device_str == "cuda": torch.cuda.empty_cache()
-        return None
+    # --- Loop through each mask provided ---
+    for i, mask_image_np in enumerate(masks_np_list):
+        print(f"\n--- Processing Object Mask #{i+1} / {len(masks_np_list)} ---")
 
-    all_points_np = all_points_tensor.cpu().numpy()
-    all_points_save_path = os.path.join(output_filename)
-    o3d_pc = npy2ply(all_points_np, colors=None, normals=None)
-    o3d.io.write_point_cloud(all_points_save_path, o3d_pc)
+        # Ensure mask is boolean
+        if mask_image_np.dtype != np.bool_:
+            print("  - Converting mask to boolean type.")
+            mask_image_np = mask_image_np.astype(np.bool_)
 
+        # Call the core inference function for the current mask
+        all_points_tensor = infer_scene_points(
+            model=model,
+            dino_model=dino_model,
+            rgb_image_np=rgb_image_np,
+            depth_image_np_metric=depth_image_np,
+            mask_image_np=mask_image_np,  # Pass the current single mask
+            intrinsics_np=intrinsics_np,
+            c2w_original_np=c2w_original_np,
+            run_octmae=run_octmae,
+            set_conf=set_conf,
+            no_input_mask=no_input_mask,
+            no_pred_mask=no_pred_mask,
+            no_filter_input_view=no_filter_input_view,
+            n_pred_views=n_pred_views,
+        )
+
+        # Process the result for the current object
+        if all_points_tensor is None or all_points_tensor.shape[0] == 0:
+            print(f"Warning: No points were reconstructed for object mask #{i+1}. Skipping.")
+            results.append(None)  # Add a placeholder for the failed object
+            continue
+
+        all_points_np = all_points_tensor.cpu().numpy()
+
+        # Create a unique filename for this object's point cloud
+        output_filepath = f"{output_filename_base}_{i}.ply"
+        print(f"  - Reconstruction successful. Saving point cloud to '{output_filepath}'")
+
+        # Convert to Open3D point cloud object
+        o3d_pc = npy2ply(all_points_np, colors=None, normals=None)
+
+        # Get the oriented 3D bounding box
+        bbox_3d = o3d_pc.get_oriented_bounding_box()
+        
+        # Add the successful reconstruction and related data to our results list
+        results.append(o3d_pc)
+
+    # Clean up GPU memory after all inferences are done
     if device_str == "cuda":
         torch.cuda.empty_cache()
-    return o3d_pc
+
+    # Return the list of structured results
+    return results
